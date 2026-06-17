@@ -1,10 +1,11 @@
 import logging
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.types import interrupt
 
 from config.settings import settings
 from graph.state import SpecKitState
-from graph.edges import route_after_spec_approval, route_after_review
+from graph.edges import route_after_spec_approval, route_after_review, route_after_implement
 from graph.nodes.collect_spec import collect_spec
 from graph.nodes.implement import implement
 from graph.nodes.rework import rework
@@ -15,11 +16,22 @@ logger = logging.getLogger(__name__)
 
 def _checkpoint_node(name: str):
     """
-    A checkpoint node suspends the graph and persists state.
-    It does nothing itself — the next webhook resumes from here.
+    Suspends the graph with interrupt() and persists state.
+    The next webhook resumes from here via Command(resume=..., update=...).
+
+    In langgraph >=1.0, the node re-executes from the start on resume.
+    `interrupt()` returns the resume value on re-execution, so the node
+    uses that to set status rather than relying on Command.update
+    (which is applied at the end and would overwrite handle_error's work).
     """
     async def node(state: SpecKitState) -> dict:
         logger.info(f"[checkpoint:{name}] Suspended. Waiting for next event.")
+        result = interrupt("waiting")
+        logger.info(f"[checkpoint:{name}] Resumed with: {result}")
+        if result == "approved":
+            return {"status": "spec-approved"}
+        if result == "rework":
+            return {"status": "needs-rework", "rework_cycle": state.get("rework_cycle", 0) + 1}
         return {}
     node.__name__ = name
     return node
@@ -41,8 +53,17 @@ def build_graph() -> StateGraph:
 
     # Linear edges
     workflow.add_edge("collect_spec", "await_spec_approval")
-    workflow.add_edge("implement", "await_review")
     workflow.add_edge("rework", "await_review")
+
+    # Conditional edge after implement (errors route to handle_error)
+    workflow.add_conditional_edges(
+        "implement",
+        route_after_implement,
+        {
+            "await_review": "await_review",
+            "handle_error": "handle_error",
+        },
+    )
 
     # Conditional edges (resume points after webhooks)
     workflow.add_conditional_edges(
@@ -66,8 +87,9 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # Error always terminates (handle_error is a dead end — human re-triggers)
-    workflow.add_edge("handle_error", END)
+    # Error routes back to await_spec_approval so the human can re-add
+    # spec-approved to retry without restarting from scratch.
+    workflow.add_edge("handle_error", "await_spec_approval")
 
     return workflow
 

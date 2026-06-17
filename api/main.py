@@ -1,13 +1,16 @@
+import asyncio
 import json
 import logging
 import sys
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
+from langgraph.types import Command
 
 from api.signature import verify_github_signature
 from config.settings import settings
 
+from github.client import get_pr_review_comments
 from graph.graph import compile_graph, thread_id
 from graph.state import SpecKitState
 
@@ -26,6 +29,31 @@ if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
 logger = logging.getLogger(__name__)
 
 graph = None
+
+# Dedup set: prevent duplicate graph invocations for the same issue
+# GitHub often sends both "opened" and "labeled" events at issue creation
+_processing: set[str] = set()
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _run_background(coro):
+    """Schedule a background task with error logging and keep a reference
+    (to prevent asyncio from silently dropping Task exceptions on GC)."""
+    task = asyncio.create_task(coro)
+
+    def _log_exception(t):
+        _background_tasks.discard(t)
+        try:
+            exc = t.exception()
+            if exc is not None:
+                logger.exception(f"Background task failed: {exc}")
+        except asyncio.InvalidStateError:
+            pass
+
+    task.add_done_callback(_log_exception)
+    _background_tasks.add(task)
+
 
 app = FastAPI(title="Personal-Dev-Setup", version="0.1.0")
 
@@ -81,9 +109,8 @@ async def handle_issues_event(action: str, payload: dict) -> None:
     issue = payload["issue"]
     repo = payload["repository"]
 
-    # When an issue is created with labels, GitHub sends "opened" (not "labeled")
     if action == "opened":
-        labels = [l["name"] for l in issue.get("labels", [])]
+        labels = [lb["name"] for lb in issue.get("labels", [])]
         if "needs-spec" in labels:
             logger.info(f"Issue #{issue['number']} opened with needs-spec on {repo['name']}")
             await trigger_collect_spec(issue, repo)
@@ -118,52 +145,110 @@ async def handle_review_event(action: str, payload: dict) -> None:
 
 
 async def trigger_collect_spec(issue: dict, repo: dict) -> None:
-    labels = [l["name"] for l in issue.get("labels", [])]
+    key = f"{repo['name']}/{issue['number']}"
+    if key in _processing:
+        logger.info(f"Skipping duplicate trigger_collect_spec for {key}")
+        return
+    _processing.add(key)
 
-    type_label = next(
-        (l for l in labels if l.startswith("type:")),
-        "type: feature"
-    )
-    priority_label = next(
-        (l for l in labels if l.startswith("priority:")),
-        "priority: normal"
-    )
+    try:
+        current_labels = [lb["name"] for lb in issue.get("labels", [])]
 
-    initial_state: SpecKitState = {
-        "issue_number": issue["number"],
-        "repo_name": repo["name"],
-        "repo_full_name": repo["full_name"],
-        "type_label": type_label,
-        "priority_label": priority_label,
-        "issue_title": issue["title"],
-        "issue_body": issue["body"] or "",
-        "spec_text": "",
-        "branch_name": "",
-        "pr_number": None,
-        "review_comments": [],
-        "status": "needs-spec",
-        "agent_output": "",
-        "rework_cycle": 0,
-        "error": None,
-    }
+        type_label = next(
+            (lb for lb in current_labels if lb.startswith("type:")),
+            "type: feature"
+        )
+        priority_label = next(
+            (lb for lb in current_labels if lb.startswith("priority:")),
+            "priority: normal"
+        )
 
-    config = {"configurable": {"thread_id": thread_id(repo["name"], issue["number"])}}
+        initial_state: SpecKitState = {
+            "issue_number": issue["number"],
+            "repo_name": repo["name"],
+            "repo_full_name": repo["full_name"],
+            "type_label": type_label,
+            "priority_label": priority_label,
+            "issue_title": issue["title"],
+            "issue_body": issue["body"] or "",
+            "spec_text": "",
+            "branch_name": "",
+            "pr_number": None,
+            "review_comments": [],
+            "status": "needs-spec",
+            "agent_output": "",
+            "rework_cycle": 0,
+            "error": None,
+        }
 
-    logger.info(f"Invoking graph for #{issue['number']} in {repo['name']}")
+        config = {"configurable": {"thread_id": thread_id(repo["name"], issue["number"])}}
 
-    # Run in background — don't block the webhook response
-    import asyncio
-    asyncio.create_task(graph.ainvoke(initial_state, config))
+        logger.info(f"Invoking graph for #{issue['number']} in {repo['name']}")
+
+        _run_background(graph.ainvoke(initial_state, config))
+
+    finally:
+        _processing.discard(key)
 
 
 async def trigger_implement(issue: dict, repo: dict) -> None:
-    # TODO: resume LangGraph instance at spec-approved checkpoint
-    logger.info(f"[STUB] trigger_implement: #{issue['number']} in {repo['name']}")
+    config = {"configurable": {"thread_id": thread_id(repo["name"], issue["number"])}}
+    logger.info(f"Resuming graph for #{issue['number']} in {repo['name']} (spec-approved)")
+
+    # Verify the thread exists and has a pending interrupt before resuming.
+    try:
+        state = await graph.aget_state(config)
+        if not state.tasks or not state.next:
+            logger.warning(
+                f"No pending graph state for #{issue['number']} in {repo['name']} "
+                f"(next={state.next}, tasks={len(state.tasks)}) — can't resume"
+            )
+            return
+    except Exception:
+        logger.warning(
+            f"Could not load graph state for #{issue['number']} in {repo['name']} — "
+            f"the thread may not exist. Add needs-spec label to start fresh."
+        )
+        return
+
+    # NOTE: Command.update is deliberately NOT used here. In langgraph >=1.0,
+    # Command.update is applied at the END of ainvoke and would overwrite any
+    # intermediate state changes (like handle_error clearing the error).
+    # Instead, _checkpoint_node returns the status update when it sees
+    # the resume value "approved".
+    _run_background(graph.ainvoke(
+        Command(resume="approved"),
+        config,
+    ))
 
 
 async def trigger_rework(pr: dict, repo: dict, review: dict) -> None:
-    # TODO: resume LangGraph instance at needs-rework checkpoint
-    logger.info(f"[STUB] trigger_rework: PR #{pr['number']} in {repo['name']}")
+    config = {"configurable": {"thread_id": thread_id(repo["name"], pr["number"])}}
+    raw_comments = await get_pr_review_comments(repo["full_name"], pr["number"])
+    review_comments = [
+        {
+            "path": c["path"],
+            "line": c.get("line"),
+            "body": c["body"],
+            "diff_hunk": c["diff_hunk"],
+        }
+        for c in raw_comments
+    ]
+    logger.info(
+        f"Resuming graph for PR #{pr['number']} in {repo['name']} "
+        f"({len(review_comments)} review comments)"
+    )
+    # NOTE: Command.update with status is not used — _checkpoint_node
+    # returns {"status": "needs-rework"} when it sees resume="rework".
+    # review_comments are passed via Command.update because they come from
+    # the webhook payload, not from the checkpoint node.
+    _run_background(graph.ainvoke(
+        Command(
+            resume="rework",
+            update={"review_comments": review_comments},
+        ),
+        config,
+    ))
 
 
 if __name__ == "__main__":

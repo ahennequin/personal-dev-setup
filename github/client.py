@@ -94,3 +94,33 @@ async def list_open_issues_with_label(
 
 async def get_label_names(issue: dict) -> list[str]:
     return [label["name"] for label in issue.get("labels", [])]
+
+
+async def get_repo(repo_full_name: str) -> dict:
+    url = f"{BASE_URL}/repos/{repo_full_name}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=_headers())
+        r.raise_for_status()
+        return r.json()
+
+
+async def create_pull_request(
+    repo_full_name: str,
+    title: str,
+    body: str,
+    head: str,
+    base: str,
+    draft: bool = True,
+) -> dict:
+    url = f"{BASE_URL}/repos/{repo_full_name}/pulls"
+    payload = {
+        "title": title,
+        "body": body,
+        "head": head,
+        "base": base,
+        "draft": draft,
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, headers=_headers(), json=payload)
+        r.raise_for_status()
+        return r.json()

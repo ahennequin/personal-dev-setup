@@ -34,7 +34,10 @@ async def handle_error(state: SpecKitState) -> dict:
 
     logger.info(f"[handle_error] Recovery label for retry: {recovery_label}")
 
+    # Reset to spec-draft so the human can re-add spec-approved to retry.
+    # The edge from handle_error goes to await_spec_approval (not END),
+    # so the graph pauses at the checkpoint and waits for the next event.
     return {
-        "status": "error",
-        "error": error,
+        "status": "spec-draft",
+        "error": None,
     }

@@ -32,6 +32,18 @@ def test_state_construction():
     assert state["error"] is None
 
 
+def test_route_after_implement_ok():
+    from graph.edges import route_after_implement
+    state = make_state(status="spec-approved")
+    assert route_after_implement(state) == "await_review"
+
+
+def test_route_after_implement_error():
+    from graph.edges import route_after_implement
+    state = make_state(status="spec-approved", error="something broke")
+    assert route_after_implement(state) == "handle_error"
+
+
 def test_route_after_spec_approval_approved():
     from graph.edges import route_after_spec_approval
     state = make_state(status="spec-approved")

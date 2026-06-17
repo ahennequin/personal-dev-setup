@@ -1,6 +1,13 @@
 from graph.state import SpecKitState
 
 
+def route_after_implement(state: SpecKitState) -> str:
+    """Route after implement node completes."""
+    if state["error"]:
+        return "handle_error"
+    return "await_review"
+
+
 def route_after_spec_approval(state: SpecKitState) -> str:
     """Route from await_spec_approval checkpoint."""
     if state["error"]:
