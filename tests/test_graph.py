@@ -1,5 +1,3 @@
-import pytest
-from unittest.mock import AsyncMock, patch
 
 from graph.state import SpecKitState
 
@@ -56,6 +54,12 @@ def test_route_after_spec_approval_waiting():
     assert route_after_spec_approval(state) == "await_spec_approval"
 
 
+def test_route_after_spec_approval_re_spec():
+    from graph.edges import route_after_spec_approval
+    state = make_state(status="needs-spec")
+    assert route_after_spec_approval(state) == "collect_spec"
+
+
 def test_route_after_spec_approval_error():
     from graph.edges import route_after_spec_approval
     state = make_state(status="spec-draft", error="Something went wrong")
@@ -78,3 +82,27 @@ def test_route_after_review_waiting():
     from graph.edges import route_after_review
     state = make_state(status="in-progress")
     assert route_after_review(state) == "await_review"
+
+
+def test_route_entry_needs_spec():
+    from graph.edges import route_entry
+    state = make_state(status="needs-spec")
+    assert route_entry(state) == "collect_spec"
+
+
+def test_route_entry_spec_approved_with_spec():
+    from graph.edges import route_entry
+    state = make_state(status="spec-approved", spec_text="Some spec")
+    assert route_entry(state) == "implement"
+
+
+def test_route_entry_spec_draft_with_spec():
+    from graph.edges import route_entry
+    state = make_state(status="spec-draft", spec_text="Some spec")
+    assert route_entry(state) == "await_spec_approval"
+
+
+def test_route_entry_spec_draft_no_spec():
+    from graph.edges import route_entry
+    state = make_state(status="spec-draft", spec_text="")
+    assert route_entry(state) == "collect_spec"

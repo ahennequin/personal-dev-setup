@@ -33,7 +33,7 @@ async def run_opencode(
         mode="w",
         suffix=".txt",
         delete=False,
-        prefix=f"speckit-prompt-",
+        prefix="speckit-prompt-",
     ) as f:
         f.write(prompt)
         prompt_file = Path(f.name)

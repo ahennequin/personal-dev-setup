@@ -1,4 +1,5 @@
 from pathlib import Path
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -9,10 +10,41 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # GitHub
+    # GitHub (user identity — used as fallback when bot identity is not configured)
     github_pat: str
     github_webhook_secret: str
     github_username: str
+    github_repos: list[str] = []
+
+    # GitHub App (bot identity — optional; when set, all spec-kit API calls
+    # use the bot's installation token instead of the user's PAT)
+    github_app_id: str = ""
+    github_app_private_key_path: Path = Path("")
+
+    @field_validator("github_app_private_key_path", mode="before")
+    @classmethod
+    def expand_path(cls, v):
+        if isinstance(v, str) and v.startswith("~"):
+            return Path(v).expanduser()
+        return v
+    github_app_installation_id: str = ""
+    github_bot_username: str = ""
+
+    @property
+    def has_bot_identity(self) -> bool:
+        return bool(
+            self.github_app_id
+            and self.github_app_private_key_path
+            and self.github_app_installation_id
+            and self.github_bot_username
+        )
+
+    @field_validator("github_repos", mode="before")
+    @classmethod
+    def split_github_repos(cls, v):
+        if isinstance(v, str):
+            return [r.strip() for r in v.split(",") if r.strip()]
+        return v or []
 
     # OpenCode
     opencode_model: str = "opencode/deepseek-v4-flash-free"

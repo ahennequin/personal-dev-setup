@@ -1,6 +1,5 @@
 import logging
 
-from traces.schema import TraceEvent
 from traces.store import get_events_for_issue, update_scores
 
 logger = logging.getLogger(__name__)

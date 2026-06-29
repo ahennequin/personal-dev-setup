@@ -15,8 +15,11 @@ dependencies = [
     "httpx>=0.27.0",
     # Config
     "pydantic-settings>=2.0.0",
+    # Auth (GitHub App JWT)
+    "pyjwt[crypto]>=2.8.0",
     # Utilities
     "python-dotenv>=1.0.0",
+    "msgpack>=1.2.1",
 ]
 
 [project.optional-dependencies]

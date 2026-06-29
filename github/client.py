@@ -1,7 +1,9 @@
 import logging
-from typing import Optional
+import time
+from datetime import datetime, timezone
 
 import httpx
+import jwt
 
 from config.settings import settings
 
@@ -9,10 +11,64 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.github.com"
 
+# Bot token cache (GitHub App installation tokens expire after 1 hour)
+_bot_token: str | None = None
+_bot_token_expires_at: float = 0
 
-def _headers() -> dict:
+
+async def _fetch_installation_token() -> tuple[str, float]:
+    """Exchange a GitHub App JWT for an installation access token."""
+    now = int(time.time())
+    jwt_payload = {
+        "iat": now - 60,
+        "exp": now + 600,
+        "iss": settings.github_app_id,
+    }
+    private_key = settings.github_app_private_key_path.read_text()
+    app_jwt = jwt.encode(jwt_payload, private_key, algorithm="RS256")
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{BASE_URL}/app/installations/{settings.github_app_installation_id}/access_tokens",
+            headers={
+                "Authorization": f"Bearer {app_jwt}",
+                "Accept": "application/vnd.github.v3+json",
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+
+    expires_at = (
+        datetime.fromisoformat(data["expires_at"].replace("Z", "+00:00"))
+        .replace(tzinfo=timezone.utc)
+        .timestamp()
+    )
+    logger.info(f"Fetched new GitHub App installation token (expires at {data['expires_at']})")
+    return data["token"], expires_at
+
+
+async def _get_bot_token() -> str:
+    """Get a valid installation token, refreshing the cached one if needed."""
+    global _bot_token, _bot_token_expires_at
+
+    if _bot_token and time.time() < _bot_token_expires_at - 120:
+        return _bot_token
+
+    _bot_token, _bot_token_expires_at = await _fetch_installation_token()
+    return _bot_token
+
+
+async def _get_token() -> str:
+    """Return the bot installation token if configured, otherwise the user PAT."""
+    if settings.has_bot_identity:
+        return await _get_bot_token()
+    return settings.github_pat
+
+
+async def _headers() -> dict:
+    token = await _get_token()
     return {
-        "Authorization": f"Bearer {settings.github_pat}",
+        "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
@@ -21,20 +77,19 @@ def _headers() -> dict:
 async def post_issue_comment(repo_full_name: str, issue_number: int, body: str) -> dict:
     url = f"{BASE_URL}/repos/{repo_full_name}/issues/{issue_number}/comments"
     async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=_headers(), json={"body": body})
+        r = await client.post(url, headers=await _headers(), json={"body": body})
         r.raise_for_status()
         return r.json()
 
 
 async def post_pr_comment(repo_full_name: str, pr_number: int, body: str) -> dict:
-    # PRs and issues share the same comments endpoint on GitHub
     return await post_issue_comment(repo_full_name, pr_number, body)
 
 
 async def add_labels(repo_full_name: str, issue_number: int, labels: list[str]) -> dict:
     url = f"{BASE_URL}/repos/{repo_full_name}/issues/{issue_number}/labels"
     async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=_headers(), json={"labels": labels})
+        r = await client.post(url, headers=await _headers(), json={"labels": labels})
         r.raise_for_status()
         return r.json()
 
@@ -42,7 +97,7 @@ async def add_labels(repo_full_name: str, issue_number: int, labels: list[str]) 
 async def remove_label(repo_full_name: str, issue_number: int, label: str) -> None:
     url = f"{BASE_URL}/repos/{repo_full_name}/issues/{issue_number}/labels/{label}"
     async with httpx.AsyncClient() as client:
-        r = await client.delete(url, headers=_headers())
+        r = await client.delete(url, headers=await _headers())
         if r.status_code == 404:
             logger.warning(f"Label '{label}' not found on #{issue_number} — skipping")
             return
@@ -52,7 +107,7 @@ async def remove_label(repo_full_name: str, issue_number: int, label: str) -> No
 async def get_issue(repo_full_name: str, issue_number: int) -> dict:
     url = f"{BASE_URL}/repos/{repo_full_name}/issues/{issue_number}"
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=_headers())
+        r = await client.get(url, headers=await _headers())
         r.raise_for_status()
         return r.json()
 
@@ -60,7 +115,7 @@ async def get_issue(repo_full_name: str, issue_number: int) -> dict:
 async def get_issue_comments(repo_full_name: str, issue_number: int) -> list[dict]:
     url = f"{BASE_URL}/repos/{repo_full_name}/issues/{issue_number}/comments"
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=_headers())
+        r = await client.get(url, headers=await _headers())
         r.raise_for_status()
         return r.json()
 
@@ -68,7 +123,23 @@ async def get_issue_comments(repo_full_name: str, issue_number: int) -> list[dic
 async def get_pr_review_comments(repo_full_name: str, pr_number: int) -> list[dict]:
     url = f"{BASE_URL}/repos/{repo_full_name}/pulls/{pr_number}/comments"
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=_headers())
+        r = await client.get(url, headers=await _headers())
+        r.raise_for_status()
+        return r.json()
+
+
+async def get_issue_labels(repo_full_name: str, issue_number: int) -> list[str]:
+    url = f"{BASE_URL}/repos/{repo_full_name}/issues/{issue_number}/labels"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=await _headers())
+        r.raise_for_status()
+        return [lb["name"] for lb in r.json()]
+
+
+async def list_pr_reviews(repo_full_name: str, pr_number: int) -> list[dict]:
+    url = f"{BASE_URL}/repos/{repo_full_name}/pulls/{pr_number}/reviews"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=await _headers())
         r.raise_for_status()
         return r.json()
 
@@ -85,11 +156,21 @@ async def list_open_issues_with_label(
         "labels": label,
         "sort": sort,
         "direction": direction,
+        "per_page": 100,
     }
+    all_issues: list[dict] = []
+    page = 1
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=_headers(), params=params)
-        r.raise_for_status()
-        return r.json()
+        while True:
+            params["page"] = page
+            r = await client.get(url, headers=await _headers(), params=params)
+            r.raise_for_status()
+            issues = r.json()
+            if not issues:
+                break
+            all_issues.extend(issues)
+            page += 1
+    return all_issues
 
 
 async def get_label_names(issue: dict) -> list[str]:
@@ -99,7 +180,7 @@ async def get_label_names(issue: dict) -> list[str]:
 async def get_repo(repo_full_name: str) -> dict:
     url = f"{BASE_URL}/repos/{repo_full_name}"
     async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=_headers())
+        r = await client.get(url, headers=await _headers())
         r.raise_for_status()
         return r.json()
 
@@ -121,6 +202,6 @@ async def create_pull_request(
         "draft": draft,
     }
     async with httpx.AsyncClient() as client:
-        r = await client.post(url, headers=_headers(), json=payload)
+        r = await client.post(url, headers=await _headers(), json=payload)
         r.raise_for_status()
         return r.json()
